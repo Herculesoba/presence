@@ -5,7 +5,11 @@ function generateAgoraToken(channelName, uid, expiry = 3600) {
   const appCertificate = process.env.AGORA_APP_CERTIFICATE;
 
   if (!appId || !appCertificate) {
-    throw new Error(`Agora credentials missing — APP_ID: ${!!appId}, CERTIFICATE: ${!!appCertificate}`);
+    console.error('❌ Agora credentials missing:', {
+      hasAppId: !!appId,
+      hasCertificate: !!appCertificate
+    });
+    throw new Error(`Agora credentials not configured on server. AGORA_APP_ID=${!!appId}, AGORA_APP_CERTIFICATE=${!!appCertificate}`);
   }
 
   const role = RtcRole.ROLE_PUBLISHER;
@@ -13,7 +17,7 @@ function generateAgoraToken(channelName, uid, expiry = 3600) {
   const currentTimestamp = Math.floor(Date.now() / 1000);
   const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
-  console.log(`Generating Agora token for channel=${channelName}, uid=${uid}, appId=${appId.substring(0,8)}...`);
+  console.log(`🔑 Generating Agora token for channel=${channelName}, uid=${uid}, appId=${appId.substring(0,8)}...`);
 
   const token = RtcTokenBuilder.buildTokenWithUid(
     appId,
@@ -24,7 +28,7 @@ function generateAgoraToken(channelName, uid, expiry = 3600) {
     privilegeExpiredTs
   );
 
-  console.log(`Token generated successfully, length=${token.length}`);
+  console.log(`✅ Token generated, length=${token.length}`);
   return token;
 }
 
