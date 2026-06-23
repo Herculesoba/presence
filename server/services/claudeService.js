@@ -10,7 +10,7 @@ async function generateSummary({ transcript, meetingName, roomType, duration, pa
   const participantList = Array.isArray(participants) ? participants.join(', ') : 'Team members';
   const durationMins = Math.floor((duration || 0) / 60);
 
-  const prompt = `You are the AI Meeting Assistant for PRESENCE, an immersive 3D teleconferencing application.
+  const userMessage = `You are the AI Meeting Assistant for PRESENCE, an immersive 3D teleconferencing application.
 Given the following meeting transcript, generate a structured JSON summary.
 
 Meeting Details:
@@ -36,12 +36,12 @@ Respond ONLY with a valid JSON object in this exact format (no markdown, no back
     const response = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-3-5-sonnet-20241022',
         max_tokens: 1024,
         messages: [
           {
             role: 'user',
-            content: prompt
+            content: userMessage
           }
         ]
       },
@@ -51,21 +51,23 @@ Respond ONLY with a valid JSON object in this exact format (no markdown, no back
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
           'anthropic-dangerous-direct-browser-access': 'true'
-        }
+        },
+        timeout: 30000
       }
     );
 
-    const text = response.data.content[0].text;
-    // Extract JSON from the response
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const rawText = response.data.content?.[0]?.text || '';
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
     }
-    throw new Error('Could not parse JSON from response');
+    console.error('Claude response text:', rawText.substring(0, 200));
+    throw new Error('Could not parse JSON from Claude response');
 
   } catch (err) {
-    console.error('Claude API error:', err.response?.data || err.message);
-    throw err;
+    const errMsg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error('Claude API error:', errMsg);
+    throw new Error(`Claude API call failed: ${errMsg}`);
   }
 }
 

@@ -29,7 +29,7 @@ let renderer = null;
 let meetingTranscript = '';
 
 // ── SERVER API ───────────────────────────────────────────────
-const API_BASE = ''; // set to Railway URL after deployment
+const API_BASE = 'https://presence-production-ad5a.up.railway.app';
 
 async function apiAgoraToken(meetingId, uid) {
   const res = await fetch(`${API_BASE}/api/agora/token`, {

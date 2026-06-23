@@ -1,18 +1,19 @@
-const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+const { RtcTokenBuilder, RtcRole } = require('agora-token');
 
 function generateAgoraToken(channelName, uid, expiry = 3600) {
   const appId = process.env.AGORA_APP_ID;
   const appCertificate = process.env.AGORA_APP_CERTIFICATE;
 
   if (!appId || !appCertificate) {
-    throw new Error('Agora credentials not configured');
+    throw new Error(`Agora credentials missing — APP_ID: ${!!appId}, CERTIFICATE: ${!!appCertificate}`);
   }
 
-  // Role = 1 for broadcaster/host, 2 for audience
   const role = RtcRole.ROLE_PUBLISHER;
-  const expirationTimeInSeconds = expiry; // 1 hour default
+  const expirationTimeInSeconds = expiry;
   const currentTimestamp = Math.floor(Date.now() / 1000);
   const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+  console.log(`Generating Agora token for channel=${channelName}, uid=${uid}, appId=${appId.substring(0,8)}...`);
 
   const token = RtcTokenBuilder.buildTokenWithUid(
     appId,
@@ -23,6 +24,7 @@ function generateAgoraToken(channelName, uid, expiry = 3600) {
     privilegeExpiredTs
   );
 
+  console.log(`Token generated successfully, length=${token.length}`);
   return token;
 }
 
