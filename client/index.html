@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PRESENCE — Immersive 3D Teleconferencing</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <div style="font-size:0.9rem;color:#8899aa;">Loading PRESENCE...</div>
+</div>
+
+<!-- ── AUTH SCREEN ── -->
+<div class="screen" id="auth-screen">
+  <div class="logo">PRESENCE</div>
+  <div class="tagline">WHERE REMOTE MEETINGS FINALLY FEEL REAL</div>
+  <div class="card">
+    <h2>Welcome</h2>
+    <p>Sign in to create or join immersive 3D meetings.</p>
+    <p id="auth-error" class="error"></p>
+
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-signin">Sign In</button>
+      <button class="auth-tab" id="tab-signup">Sign Up</button>
+    </div>
+
+    <!-- Sign In Form -->
+    <form class="auth-form active" id="form-signin" onsubmit="return false">
+      <input type="email" id="signin-email" placeholder="Email address" />
+      <input type="password" id="signin-password" placeholder="Password" />
+      <p id="signin-error" class="error" style="margin-top:4px"></p>
+      <button class="btn btn-primary" id="btn-signin">Sign In</button>
+      <div class="divider">── or ──</div>
+      <button class="btn btn-secondary" id="btn-google" type="button">Sign in with Google</button>
+    </form>
+
+    <!-- Sign Up Form -->
+    <form class="auth-form" id="form-signup" onsubmit="return false">
+      <input type="text" id="signup-name" placeholder="Display name" />
+      <input type="email" id="signup-email" placeholder="Email address" />
+      <input type="password" id="signup-password" placeholder="Password (min 6 characters)" />
+      <p id="signup-error" class="error" style="margin-top:4px"></p>
+      <button class="btn btn-primary" id="btn-signup">Create Account</button>
+      <div class="divider">── or ──</div>
+      <button class="btn btn-secondary" id="btn-google-signup" type="button">Sign up with Google</button>
+    </form>
+  </div>
+</div>
+
+<!-- ── DASHBOARD SCREEN ── -->
+<div class="screen" id="dashboard-screen" style="display:none">
+  <div class="logo">PRESENCE</div>
+  <div class="tagline">WHERE REMOTE MEETINGS FINALLY FEEL REAL</div>
+  <div class="card" style="max-width:520px">
+    <div class="dash-greeting">
+      <h2>Good to see you, <span id="dash-name" style="color:#4466ff"></span> <span id="user-badge" class="user-badge">USER</span></h2>
+      <p style="color:#8899aa;font-size:0.8rem;margin-top:4px" id="dash-email"></p>
+    </div>
+
+    <p>Create a new meeting or join one with a link.</p>
+    <p id="join-error" class="error"></p>
+
+    <div class="section-label">CREATE A NEW MEETING</div>
+    <input type="text" id="input-meeting-name" placeholder="Meeting name (e.g. Team Standup)" />
+    <select id="input-room-type">
+      <option value="boardroom">🏢 Boardroom</option>
+      <option value="studio">🎨 Creative Studio</option>
+      <option value="lounge">☕ Casual Lounge</option>
+      <option value="classroom">📚 Classroom</option>
+    </select>
+    <button class="btn btn-primary" id="btn-create">Create Meeting</button>
+
+    <div class="link-box" id="link-box">
+      <span id="meeting-link"></span>
+      <button class="copy-btn" id="btn-copy">Copy Link</button>
+    </div>
+    <p class="link-note" id="link-note">Share this link with participants. They can paste it below to join.</p>
+
+    <div class="divider">── join a meeting ──</div>
+    <input type="text" id="input-join-code" placeholder="Paste meeting link or code" />
+    <button class="btn btn-secondary" id="btn-join">Enter Room →</button>
+
+    <div id="admin-panel" style="display:none" class="admin-panel">
+      <h3>🔴 Admin Dashboard</h3>
+      <div class="admin-stat">
+        <span class="admin-stat-label">Total Meetings</span>
+        <span class="admin-stat-value" id="stat-meetings">—</span>
+      </div>
+      <div class="admin-stat">
+        <span class="admin-stat-label">Active Users</span>
+        <span class="admin-stat-value" id="stat-users">—</span>
+      </div>
+      <div class="admin-stat">
+        <span class="admin-stat-label">Platform Status</span>
+        <span class="admin-stat-value" style="color:#22c55e">Operational</span>
+      </div>
+    </div>
+
+    <button class="btn-ghost" id="btn-logout" style="margin-top:16px;text-align:center;display:block">← Sign Out</button>
+  </div>
+</div>
+
+<!-- ── MEETING SCREEN ── -->
+<canvas id="three-canvas"></canvas>
+<div id="meeting-screen">
+  <div class="hud-top">
+    <div class="hud-brand">PRESENCE</div>
+    <div class="hud-info">
+      <div class="hud-badge">👤 <span id="hud-user"></span></div>
+      <div class="hud-badge">🔗 <span id="hud-code"></span></div>
+      <div class="hud-badge">🏢 <span id="hud-room-type"></span></div>
+      <div class="hud-timer" id="hud-timer">00:00</div>
+    </div>
+  </div>
+  <div class="hud-participants">
+    <h4>PARTICIPANTS</h4>
+    <div class="participant"><div class="participant-dot" id="user-dot"></div> <span id="hud-user-name"></span> (You)</div>
+    <div class="participant"><div class="participant-dot" style="background:#e74c3c"></div> Alex</div>
+    <div class="participant"><div class="participant-dot" style="background:#2ecc71"></div> Sarah</div>
+    <div class="participant"><div class="participant-dot" style="background:#f39c12"></div> James</div>
+  </div>
+  <div class="nav-hint">WASD or Arrow Keys to move · Mouse to look around</div>
+  <div class="hud-controls">
+    <button class="ctrl-btn" id="btn-mute">🎤 Mute</button>
+    <button class="ctrl-btn">📷 Camera</button>
+    <button class="ctrl-btn">💬 Chat</button>
+    <button class="ctrl-btn">🖥️ Share Screen</button>
+    <button class="ctrl-btn btn-danger" id="btn-leave">Leave Meeting</button>
+  </div>
+</div>
+
+<!-- ── AI SUMMARY SCREEN ── -->
+<div id="summary-screen" style="display:none">
+  <div class="summary-card">
+    <div class="ai-badge">✨ Generated by PRESENCE AI Assistant</div>
+    <h2>Meeting Summary</h2>
+    <div class="summary-meta" id="summary-meta"></div>
+    <div class="summary-section">
+      <h3>PARTICIPANTS</h3>
+      <div id="summary-participants"></div>
+    </div>
+    <div class="summary-section">
+      <h3>KEY TOPICS DISCUSSED</h3>
+      <div id="summary-topics"></div>
+    </div>
+    <div class="summary-section">
+      <h3>DECISIONS MADE</h3>
+      <div id="summary-decisions"></div>
+    </div>
+    <div class="summary-section">
+      <h3>ACTION ITEMS</h3>
+      <div id="summary-actions"></div>
+    </div>
+    <button class="btn btn-primary" id="btn-done" style="margin-top:10px">Back to Dashboard</button>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
