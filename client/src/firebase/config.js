@@ -1,6 +1,26 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, collection, addDoc, updateDoc, arrayUnion, serverTimestamp } from 'firebase/firestore';
+import {
+  getAuth,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signInAnonymously,
+  signOut
+} from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  getDoc,
+  collection,
+  addDoc,
+  updateDoc,
+  arrayUnion,
+  serverTimestamp
+} from 'firebase/firestore';
+import { getDatabase, ref, push, onChildAdded, query, limitToLast } from 'firebase/database';
 
 const firebaseConfig = {
   apiKey: "AIzaSyCHWunn4D-5GTI5HL4EqzYdPglu3Z9iojE",
@@ -16,16 +36,19 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const rtdb = getDatabase(app);
 const googleProvider = new GoogleAuthProvider();
 
 export {
   auth,
   db,
+  rtdb,
   onAuthStateChanged,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signInWithPopup,
   googleProvider,
+  signInAnonymously,
   signOut,
   doc,
   setDoc,
@@ -34,7 +57,12 @@ export {
   addDoc,
   updateDoc,
   arrayUnion,
-  serverTimestamp
+  serverTimestamp,
+  ref,
+  push,
+  onChildAdded,
+  query,
+  limitToLast
 };
 
 export async function createUserProfile(user, additionalData = {}) {
@@ -70,7 +98,7 @@ export async function createMeeting({ hostUid, hostName, name, roomType }) {
     participants: [{ uid: hostUid, name: hostName, isHost: true }],
     status: 'waiting',
     createdAt: serverTimestamp(),
-    link: '' // will be updated
+    link: ''
   });
   const link = `presence://meet/${docRef.id}`;
   await updateDoc(doc(db, 'meetings', docRef.id), { link });
@@ -93,7 +121,7 @@ export async function joinMeeting(meetingId, uid, name) {
 export async function leaveMeeting(meetingId, uid) {
   const meeting = await getMeeting(meetingId);
   if (!meeting) return;
-  const updated = meeting.participants.filter(p => p.uid !== uid);
+  const updated = (meeting.participants || []).filter(p => p.uid !== uid);
   await updateDoc(doc(db, 'meetings', meetingId), {
     participants: updated,
     status: updated.length === 0 ? 'ended' : 'active'

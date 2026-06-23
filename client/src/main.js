@@ -1,7 +1,8 @@
 import * as THREE from 'three';
-import AgoraRTC from 'agora-rtc-sdk-ng';
 import {
   auth,
+  db,
+  rtdb,
   onAuthStateChanged,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -11,8 +12,21 @@ import {
   createUserProfile,
   getUserProfile,
   joinMeeting,
-  leaveMeeting
+  leaveMeeting,
+  ref,
+  push,
+  onChildAdded,
+  query,
+  limitToLast
 } from './firebase/config.js';
+
+// ── ADMIN EMAIL CHECK ──────────────────────────────────────────
+function isAdminEmail(email) {
+  const adminEmails = [
+    'herculesoba@gmail.com',  // REPLACE WITH YOUR ACTUAL EMAIL
+  ];
+  return adminEmails.includes((email || '').toLowerCase());
+}
 
 // ── GLOBAL STATE ─────────────────────────────────────────────
 let currentUser = null;
@@ -24,15 +38,10 @@ let meetingTimer = 0;
 let timerInterval = null;
 let muted = false;
 let renderer = null;
-
-// ── AGORA + SPATIAL AUDIO STATE ─────────────────────────────
-let agoraClient = null;
-let localAudioTrack = null;
-let spatialAudioManager = null;
-let remoteUsers = new Map(); // uid -> { audioTrack, panner, position, name }
-let userPosition = { x: 0, y: 1, z: 4 }; // Local user avatar position
-let broadcastInterval = null;
-let otherAvatars = []; // 3D avatar objects for remote users
+let isGuest = false;
+let guestDisplayName = '';
+let chatUnsubscribe = null;
+let chatPanelOpen = false;
 
 // ── SERVER API ───────────────────────────────────────────────
 const API_BASE = 'https://presence-production-ad5a.up.railway.app';
@@ -89,419 +98,48 @@ async function apiLeaveMeeting(id, uid) {
   });
 }
 
-// ── SPATIAL AUDIO MANAGER ─────────────────────────────────────
-class SpatialAudioManager {
-  constructor() {
-    this.audioContext = null;
-    this.listener = null;
-    this.panners = new Map(); // uid -> PannerNode
-    this.gainNodes = new Map(); // uid -> GainNode
-    this.mediaElements = new Map(); // uid -> MediaElement
-    this.initialized = false;
-  }
-
-  async init() {
-    if (this.initialized) return;
-    try {
-      this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      this.listener = this.audioContext.listener;
-
-      // Position listener at camera origin (0, 1.6, 0) — our camera height
-      if (this.listener.positionX) {
-        this.listener.positionX.setValueAtTime(0, this.audioContext.currentTime);
-        this.listener.positionY.setValueAtTime(1.6, this.audioContext.currentTime);
-        this.listener.positionZ.setValueAtTime(0, this.audioContext.currentTime);
-      } else {
-        this.listener.setPosition(0, 1.6, 0);
-      }
-
-      // Resume audio context (required after user gesture)
-      if (this.audioContext.state === 'suspended') {
-        await this.audioContext.resume();
-      }
-
-      this.initialized = true;
-      console.log('✅ SpatialAudioManager initialized');
-    } catch (err) {
-      console.error('SpatialAudioManager init error:', err);
-    }
-  }
-
-  updateListenerPosition(x, y, z) {
-    if (!this.listener || !this.initialized) return;
-    try {
-      if (this.listener.positionX) {
-        this.listener.positionX.setValueAtTime(x, this.audioContext.currentTime);
-        this.listener.positionY.setValueAtTime(y, this.audioContext.currentTime);
-        this.listener.positionZ.setValueAtTime(z, this.audioContext.currentTime);
-      } else {
-        this.listener.setPosition(x, y, z);
-      }
-    } catch (err) {
-      console.error('Error updating listener position:', err);
-    }
-  }
-
-  updateListenerOrientation(yaw, pitch) {
-    if (!this.listener || !this.initialized) return;
-    try {
-      // Convert camera yaw/pitch to forward vector
-      const forwardX = Math.sin(yaw);
-      const forwardY = 0;
-      const forwardZ = -Math.cos(yaw);
-
-      if (this.listener.forwardX) {
-        this.listener.forwardX.setValueAtTime(forwardX, this.audioContext.currentTime);
-        this.listener.forwardY.setValueAtTime(forwardY, this.audioContext.currentTime);
-        this.listener.forwardZ.setValueAtTime(forwardZ, this.audioContext.currentTime);
-        this.listener.upX.setValueAtTime(0, this.audioContext.currentTime);
-        this.listener.upY.setValueAtTime(1, this.audioContext.currentTime);
-        this.listener.upZ.setValueAtTime(0, this.audioContext.currentTime);
-      }
-    } catch (err) {
-      console.error('Error updating listener orientation:', err);
-    }
-  }
-
-  // Add a remote user's audio stream with spatial positioning
-  addRemoteAudio(uid, audioTrack) {
-    if (!this.initialized || this.panners.has(uid)) return;
-
-    try {
-      // Create PannerNode for 3D positioning
-      const panner = this.audioContext.createPanner();
-      panner.panningModel = 'HRTF';
-      panner.distanceModel = 'inverse';
-      panner.refDistance = 1;
-      panner.maxDistance = 50;
-      panner.rolloffFactor = 1;
-      panner.coneInnerAngle = 360;
-      panner.coneOuterAngle = 0;
-      panner.coneOuterGain = 0;
-
-      // Initial position — will be updated when avatar moves
-      panner.positionX.setValueAtTime(2, this.audioContext.currentTime);
-      panner.positionY.setValueAtTime(1, this.audioContext.currentTime);
-      panner.positionZ.setValueAtTime(1.5, this.audioContext.currentTime);
-
-      // Create gain node for volume control
-      const gainNode = this.audioContext.createGain();
-      gainNode.gain.setValueAtTime(1.0, this.audioContext.currentTime);
-
-      // Create media element from audio track
-      const mediaElement = audioTrack.getMediaElement();
-      mediaElement.autoplay = false;
-
-      // Connect: mediaElement -> panner -> gain -> destination
-      const source = this.audioContext.createMediaElementSource(mediaElement);
-      source.connect(panner);
-      panner.connect(gainNode);
-      gainNode.connect(this.audioContext.destination);
-
-      // Set default orientation (omnidirectional)
-      panner.orientationX.setValueAtTime(1, this.audioContext.currentTime);
-      panner.orientationY.setValueAtTime(0, this.audioContext.currentTime);
-      panner.orientationZ.setValueAtTime(0, this.audioContext.currentTime);
-
-      this.panners.set(uid, panner);
-      this.gainNodes.set(uid, gainNode);
-      this.mediaElements.set(uid, mediaElement);
-
-      // Play the audio
-      mediaElement.play().catch(err => console.warn('Audio autoplay prevented:', err));
-
-      console.log(`✅ Added spatial audio for user ${uid}`);
-    } catch (err) {
-      console.error(`Error adding spatial audio for ${uid}:`, err);
-    }
-  }
-
-  // Update a remote user's 3D position based on avatar position in scene
-  updateRemotePosition(uid, x, y, z) {
-    const panner = this.panners.get(uid);
-    if (!panner || !this.initialized) return;
-    try {
-      const now = this.audioContext.currentTime;
-      panner.positionX.linearRampToValueAtTime(x, now + 0.05);
-      panner.positionY.linearRampToValueAtTime(y, now + 0.05);
-      panner.positionZ.linearRampToValueAtTime(z, now + 0.05);
-    } catch (err) {
-      console.error('Error updating remote position:', err);
-    }
-  }
-
-  // Mute/unmute a specific remote user
-  setRemoteVolume(uid, volume) {
-    const gainNode = this.gainNodes.get(uid);
-    if (!gainNode) return;
-    try {
-      gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
-    } catch (err) {
-      console.error('Error setting remote volume:', err);
-    }
-  }
-
-  // Remove a remote user
-  removeRemoteAudio(uid) {
-    try {
-      const panner = this.panners.get(uid);
-      const gainNode = this.gainNodes.get(uid);
-      const mediaElement = this.mediaElements.get(uid);
-
-      if (panner) {
-        panner.disconnect();
-        this.panners.delete(uid);
-      }
-      if (gainNode) {
-        gainNode.disconnect();
-        this.gainNodes.delete(uid);
-      }
-      if (mediaElement) {
-        mediaElement.pause();
-        this.mediaElements.delete(uid);
-      }
-    } catch (err) {
-      console.error('Error removing remote audio:', err);
-    }
-  }
-
-  destroy() {
-    try {
-      if (this.audioContext) {
-        this.audioContext.close();
-      }
-      this.panners.clear();
-      this.gainNodes.clear();
-      this.mediaElements.clear();
-      this.initialized = false;
-    } catch (err) {
-      console.error('Error destroying SpatialAudioManager:', err);
-    }
-  }
+// ── CHAT FUNCTIONS (Firebase RTDB) ───────────────────────────
+function sendChatMessage(text) {
+  if (!text.trim() || !meetingCode) return;
+  const chatRef = ref(rtdb, `chats/${meetingCode}`);
+  push(chatRef, {
+    uid: currentUser?.uid || 'guest',
+    name: isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email || 'Guest'),
+    text: text.trim(),
+    timestamp: Date.now()
+  });
 }
 
-// ── AGORA MANAGER ────────────────────────────────────────────
-class AgoraManager {
-  constructor() {
-    this.client = null;
-    this.localUid = Math.floor(Math.random() * 999999);
-    this.channelName = null;
-    this.token = null;
-    this.joined = false;
-  }
-
-  async joinChannel(channel, token) {
-    try {
-      this.channelName = channel;
-      this.token = token;
-
-      // Create Agora RTC client
-      this.client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
-
-      // Set up event handlers
-      this.client.on('user-published', async (user, mediaType) => {
-        console.log(`📢 User ${user.uid} published ${mediaType}`);
-        if (mediaType === 'audio') {
-          // Subscribe to the remote audio track
-          await this.client.subscribe(user, mediaType);
-          console.log(`✅ Subscribed to audio from ${user.uid}`);
-
-          // Add to spatial audio system
-          await spatialAudioManager.init();
-          spatialAudioManager.addRemoteAudio(user.uid, user.audioTrack);
-
-          // Get initial position from data channel or default
-          const pos = remoteUsers.get(user.uid)?.position || { x: 2, y: 1, z: 1.5 };
-          spatialAudioManager.updateRemotePosition(user.uid, pos.x, pos.y, pos.z);
-        }
-      });
-
-      this.client.on('user-unpublished', (user, mediaType) => {
-        console.log(`🔇 User ${user.uid} unpublished ${mediaType}`);
-        if (mediaType === 'audio') {
-          spatialAudioManager.removeRemoteAudio(user.uid);
-          remoteUsers.delete(user.uid);
-        }
-      });
-
-      this.client.on('user-joined', (user) => {
-        console.log(`👋 User ${user.uid} joined channel ${this.channelName}`);
-        // Initialize remote user entry
-        if (!remoteUsers.has(user.uid)) {
-          remoteUsers.set(user.uid, { audioTrack: null, position: { x: 2, y: 1, z: 1.5 }, name: `User_${user.uid}` });
-        }
-      });
-
-      this.client.on('user-left', (user) => {
-        console.log(`👋 User ${user.uid} left`);
-        spatialAudioManager.removeRemoteAudio(user.uid);
-        remoteUsers.delete(user.uid);
-      });
-
-      // Join the channel with the token
-      await this.client.join('28142cdd0c7140a493243a0bc8bc6062', channel, token, this.localUid);
-      console.log(`✅ Joined Agora channel: ${channel} as uid: ${this.localUid}`);
-
-      // Create microphone audio track
-      localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack({
-        encoderConfig: 'music_standard',
-        AGC: true,
-        ANS: true,
-        AEC: true
-      });
-
-      // Publish local audio
-      await this.client.publish(localAudioTrack);
-      console.log('✅ Published local microphone audio');
-
-      // Handle data channel messages for avatar sync
-      this.client.on('message', (msg) => {
-        this.handleDataMessage(msg);
-      });
-
-      // Start broadcasting our position
-      this.startPositionBroadcast();
-
-      this.joined = true;
-      return true;
-
-    } catch (err) {
-      console.error('❌ Agora join error:', err);
-      throw err;
-    }
-  }
-
-  // Send avatar position to all other users via data channel
-  broadcastPosition(x, y, z) {
-    if (!this.joined || !this.client) return;
-    try {
-      const msg = JSON.stringify({
-        type: 'avatar_position',
-        uid: this.localUid,
-        name: currentUserProfile?.displayName || currentUser?.email || 'Unknown',
-        x, y, z,
-        timestamp: Date.now()
-      });
-      this.client.sendStreamMessage(msg).catch(err => {
-        // Data channel may not be enabled — ignore silently
-      });
-    } catch (err) {
-      // Silently ignore — data channel is optional
-    }
-  }
-
-  // Receive and process data messages
-  handleDataMessage(msg) {
-    try {
-      const data = JSON.parse(msg);
-      if (data.type === 'avatar_position' && data.uid !== this.localUid) {
-        // Update stored position
-        const existing = remoteUsers.get(data.uid) || {};
-        remoteUsers.set(data.uid, {
-          ...existing,
-          position: { x: data.x, y: data.y, z: data.z },
-          name: data.name
-        });
-
-        // Update spatial audio position
-        if (spatialAudioManager.initialized) {
-          spatialAudioManager.updateRemotePosition(data.uid, data.x, data.y, data.z);
-        }
-
-        // Update 3D avatar position in scene
-        this.updateRemoteAvatarMesh(data.uid, data.x, data.y, data.z);
-      }
-    } catch (err) {
-      // Ignore parse errors
-    }
-  }
-
-  // Update a remote user's 3D avatar mesh position in the scene
-  updateRemoteAvatarMesh(uid, x, y, z) {
-    const avatar = otherAvatars.find(a => a.uid === uid);
-    if (avatar && avatar.body) {
-      // Smooth interpolation towards target position
-      avatar.targetX = x;
-      avatar.targetY = y;
-      avatar.targetZ = z;
-    }
-  }
-
-  // Start broadcasting position every ~33ms (~30fps)
-  startPositionBroadcast() {
-    if (broadcastInterval) clearInterval(broadcastInterval);
-    broadcastInterval = setInterval(() => {
-      if (this.joined) {
-        this.broadcastPosition(userPosition.x, userPosition.y, userPosition.z);
-      }
-    }, 33);
-  }
-
-  // Mute/unmute local microphone
-  setMute(mute) {
-    if (!localAudioTrack) return;
-    try {
-      if (mute) {
-        localAudioTrack.setEnabled(false);
-      } else {
-        localAudioTrack.setEnabled(true);
-      }
-    } catch (err) {
-      console.error('Error toggling mute:', err);
-    }
-  }
-
-  async leaveChannel() {
-    try {
-      if (broadcastInterval) {
-        clearInterval(broadcastInterval);
-        broadcastInterval = null;
-      }
-
-      if (localAudioTrack) {
-        await localAudioTrack.stop();
-        await localAudioTrack.close();
-        localAudioTrack = null;
-      }
-
-      if (this.client && this.joined) {
-        await this.client.leave();
-        this.joined = false;
-        console.log('✅ Left Agora channel');
-      }
-
-      this.client = null;
-
-      // Clean up spatial audio
-      if (spatialAudioManager) {
-        spatialAudioManager.destroy();
-        spatialAudioManager = null;
-      }
-    } catch (err) {
-      console.error('Error leaving channel:', err);
-    }
-  }
-}
-
-// ── INIT AGORA + SPATIAL AUDIO ────────────────────────────────
-async function initAgoraSession() {
+function subscribeToChat(callback) {
+  if (chatUnsubscribe) { chatUnsubscribe(); chatUnsubscribe = null; }
   try {
-    // Initialize spatial audio
-    spatialAudioManager = new SpatialAudioManager();
-    await spatialAudioManager.init();
-
-    // Get Agora token from our server
-    const { token, channelName } = await apiAgoraToken(meetingCode, agoraClient?.localUid || Math.floor(Math.random() * 99999));
-
-    // Create Agora manager and join
-    agoraClient = new AgoraManager();
-    await agoraClient.joinChannel(meetingCode, token);
-
-    return true;
+    const chatRef = ref(rtdb, `chats/${meetingCode}`);
+    const q = query(chatRef, limitToLast(100));
+    chatUnsubscribe = onChildAdded(q, (snapshot) => {
+      const data = snapshot.val();
+      if (data) callback({ id: snapshot.key, ...data });
+    });
   } catch (err) {
-    console.error('Failed to initialize Agora session:', err);
-    return false;
+    console.error('Chat subscribe error:', err);
   }
+}
+
+function renderChatMessage(msg) {
+  const container = document.getElementById('chat-messages');
+  if (!container) return;
+  const isOwn = (msg.uid === (currentUser?.uid || 'guest')) && !isGuest ||
+    (isGuest && msg.name === guestDisplayName);
+  const div = document.createElement('div');
+  div.className = `chat-message ${isOwn ? 'own' : 'other'}`;
+  div.innerHTML = `<div class="chat-msg-name">${msg.name}</div><div class="chat-msg-text">${escapeHtml(msg.text)}</div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
 }
 
 // ── SCREEN MANAGER ───────────────────────────────────────────
@@ -531,14 +169,39 @@ function showScreen(id) {
 }
 
 function showError(id, msg) {
-  const el = document.getElementId(id);
+  const el = document.getElementById(id);
   if (el) { el.textContent = msg; el.classList.add('show'); }
-  setTimeout(() => { if (el) el.classList.remove('show'); }, 4000);
+  setTimeout(() => { if (el) el.classList.remove('show'); }, 5000);
 }
 
 function showLoading(show) {
   const el = document.getElementById('loading-overlay');
   if (el) { if (show) el.classList.add('show'); else el.classList.remove('show'); }
+}
+
+// ── GUEST MODAL ──────────────────────────────────────────────
+function initGuestModal() {
+  const modal = document.getElementById('guest-modal');
+
+  document.getElementById('btn-guest-join')?.addEventListener('click', () => showScreen('guest-modal'));
+  document.getElementById('btn-guest-join-signup')?.addEventListener('click', () => showScreen('guest-modal'));
+
+  document.getElementById('btn-guest-back')?.addEventListener('click', () => showScreen('auth-screen'));
+
+  document.getElementById('btn-guest-confirm')?.addEventListener('click', async () => {
+    const name = document.getElementById('guest-name-input')?.value.trim();
+    if (!name) { showError('guest-error', 'Please enter your name'); return; }
+    guestDisplayName = name;
+    isGuest = true;
+    currentUser = { uid: 'guest_' + Math.random().toString(36).substr(2, 9), email: null };
+    currentUserProfile = { displayName: name, isAdmin: false, email: null };
+    showScreen('dashboard-screen');
+    updateDashboard();
+  });
+
+  document.getElementById('guest-name-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('btn-guest-confirm')?.click();
+  });
 }
 
 // ── AUTH ─────────────────────────────────────────────────────
@@ -572,12 +235,13 @@ function initAuth() {
     const password = document.getElementById('signin-password')?.value;
     if (!email || !password) { showError('signin-error', 'Please fill in all fields'); return; }
     showLoading(true);
+    isGuest = false;
     try {
       const cred = await signInWithEmailAndPassword(auth, email, password);
       currentUser = cred.user;
       await loadUserProfile();
     } catch (err) {
-      showError('signin-error', err.message.replace('Firebase: ', '').replace(' (auth/invalid-credential).',''));
+      showError('signin-error', err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, ''));
     }
     showLoading(false);
   });
@@ -590,13 +254,14 @@ function initAuth() {
     if (!name || !email || !password) { showError('signup-error', 'Please fill in all fields'); return; }
     if (password.length < 6) { showError('signup-error', 'Password must be at least 6 characters'); return; }
     showLoading(true);
+    isGuest = false;
     try {
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       currentUser = cred.user;
       await createUserProfile(currentUser, { displayName: name });
       await loadUserProfile();
     } catch (err) {
-      showError('signup-error', err.message.replace('Firebase: ', '').replace(' (auth/email-already-in-use).','').replace(' (auth/weak-password).',''));
+      showError('signup-error', err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, ''));
     }
     showLoading(false);
   });
@@ -604,6 +269,7 @@ function initAuth() {
   // Google OAuth
   const handleGoogleSignIn = async () => {
     showLoading(true);
+    isGuest = false;
     try {
       const cred = await signInWithPopup(auth, googleProvider);
       currentUser = cred.user;
@@ -611,7 +277,7 @@ function initAuth() {
       await loadUserProfile();
     } catch (err) {
       const errorMsg = err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, '');
-      showError('auth-error', errorMsg);
+      showError('auth-error', errorMsg || 'Google sign-in failed');
     }
     showLoading(false);
   };
@@ -621,42 +287,70 @@ function initAuth() {
 
   // Logout
   document.getElementById('btn-logout')?.addEventListener('click', async () => {
-    await signOut(auth);
+    if (!isGuest) await signOut(auth);
     currentUser = null;
     currentUserProfile = null;
+    isGuest = false;
+    guestDisplayName = '';
     showScreen('auth-screen');
   });
 
   // Auth state listener
   onAuthStateChanged(auth, async (user) => {
-    currentUser = user;
-    if (user) {
+    if (user && !isGuest) {
+      currentUser = user;
       await loadUserProfile();
-    } else {
-      showScreen('auth-screen');
     }
+    // Don't override guest state — guest users handle their own flow
   });
 }
 
 async function loadUserProfile() {
   if (!currentUser) return;
   currentUserProfile = await getUserProfile(currentUser.uid);
+  // If no Firestore profile yet (first login), create one
+  if (!currentUserProfile) {
+    currentUserProfile = {
+      displayName: currentUser.displayName || currentUser.email.split('@')[0],
+      email: currentUser.email,
+      isAdmin: isAdminEmail(currentUser.email)
+    };
+  }
+  // Check admin from email even if Firestore has no profile
+  if (!currentUserProfile.isAdmin && currentUser.email) {
+    currentUserProfile.isAdmin = isAdminEmail(currentUser.email);
+  }
   updateDashboard();
   showScreen('dashboard-screen');
 }
 
 function updateDashboard() {
-  if (!currentUserProfile) return;
-  const name = currentUserProfile.displayName || currentUser.email.split('@')[0];
+  const name = isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email?.split('@')[0] || 'Guest');
+  const email = isGuest ? 'Joining as guest' : (currentUser?.email || '');
+  const emailOrTag = isGuest ? 'Guest Session' : email;
+
   document.getElementById('dash-name').textContent = name;
-  document.getElementById('dash-email').textContent = currentUser.email;
+  document.getElementById('dash-email').textContent = emailOrTag;
+
   const badgeEl = document.getElementById('user-badge');
   if (badgeEl) {
-    badgeEl.className = currentUserProfile.isAdmin ? 'badge badge-admin' : 'badge badge-user';
-    badgeEl.textContent = currentUserProfile.isAdmin ? 'ADMIN' : 'USER';
+    if (isGuest) {
+      badgeEl.className = 'badge badge-user';
+      badgeEl.textContent = 'GUEST';
+    } else if (currentUserProfile?.isAdmin || isAdminEmail(currentUser?.email)) {
+      badgeEl.className = 'badge badge-admin';
+      badgeEl.textContent = 'ADMIN';
+    } else {
+      badgeEl.className = 'badge badge-user';
+      badgeEl.textContent = 'USER';
+    }
   }
+
+  // Admin panel — show for admin emails OR during guest session (for demo)
   const adminPanel = document.getElementById('admin-panel');
-  if (adminPanel) adminPanel.style.display = currentUserProfile.isAdmin ? 'block' : 'none';
+  if (adminPanel) {
+    adminPanel.style.display = (!isGuest && (currentUserProfile?.isAdmin || isAdminEmail(currentUser?.email))) ? 'block' : 'none';
+  }
 }
 
 // ── DASHBOARD ────────────────────────────────────────────────
@@ -664,14 +358,13 @@ function initDashboard() {
   document.getElementById('btn-create')?.addEventListener('click', async () => {
     const name = document.getElementById('input-meeting-name')?.value.trim();
     if (!name) { showError('join-error', 'Please enter a meeting name'); return; }
-    if (!currentUser || !currentUserProfile) return;
     roomType = document.getElementById('input-room-type')?.value || 'boardroom';
     meetingName = name;
     showLoading(true);
     try {
       const meeting = await apiCreateMeeting(
-        currentUser.uid,
-        currentUserProfile.displayName || currentUser.email,
+        currentUser?.uid || 'guest',
+        isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email || 'Guest'),
         meetingName, roomType
       );
       meetingCode = meeting.id;
@@ -711,8 +404,7 @@ function initDashboard() {
       if (meeting && meeting.name) {
         meetingName = meeting.name;
         roomType = meeting.roomType || roomType;
-        await apiJoinMeeting(meetingCode, currentUser.uid, currentUserProfile?.displayName || currentUser.email);
-        await joinMeeting(meetingCode, currentUser.uid, currentUserProfile?.displayName || currentUser.email);
+        await apiJoinMeeting(meetingCode, currentUser?.uid || 'guest', isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email || 'Guest'));
       }
     } catch (err) { /* proceed anyway */ }
     showLoading(false);
@@ -722,18 +414,21 @@ function initDashboard() {
 
 // ── MEETING ─────────────────────────────────────────────────
 function enterMeeting() {
-  if (!currentUserProfile) return;
+  const displayName = isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email || 'Guest');
+
   meetingTimer = 0;
-  document.getElementById('hud-user').textContent = currentUserProfile.displayName || currentUser.email;
-  document.getElementById('hud-user-name').textContent = currentUserProfile.displayName || currentUser.email;
+  document.getElementById('hud-user').textContent = displayName;
+  document.getElementById('hud-user-name').textContent = displayName;
   document.getElementById('hud-code').textContent = meetingCode;
   document.getElementById('hud-room-type').textContent = getRoomLabel(roomType);
+
   const userDot = document.getElementById('user-dot');
   if (userDot) {
-    userDot.style.background = 'rgba(99,102,241,0.3)';
-    userDot.style.color = 'var(--primary-light)';
-    userDot.textContent = (currentUserProfile.displayName || currentUser.email || 'Y').charAt(0).toUpperCase();
+    userDot.style.background = isGuest ? 'rgba(16,185,129,0.3)' : 'rgba(99,102,241,0.3)';
+    userDot.style.color = isGuest ? '#34d399' : 'var(--primary-light)';
+    userDot.textContent = (displayName || 'Y').charAt(0).toUpperCase();
   }
+
   timerInterval = setInterval(() => {
     meetingTimer++;
     const m = String(Math.floor(meetingTimer / 60)).padStart(2, '0');
@@ -741,22 +436,21 @@ function enterMeeting() {
     const timerEl = document.getElementById('hud-timer');
     if (timerEl) timerEl.textContent = `${m}:${s}`;
   }, 1000);
+
   document.querySelectorAll('.screen').forEach(el => el.style.display = 'none');
   document.getElementById('three-canvas').style.display = 'block';
   const meetingScreen = document.getElementById('meeting-screen');
   if (meetingScreen) meetingScreen.style.display = 'flex';
+
   const muteBtn = document.getElementById('btn-mute');
   if (muteBtn) { muteBtn.textContent = '🎤 Mute'; muteBtn.classList.remove('muted'); muted = false; }
 
-  // Initialize Agora session (voice + spatial audio)
-  initAgoraSession().then(joined => {
-    if (joined) {
-      console.log('🎙️ Agora voice session active');
-      // Prompt user to use headphones
-      const navHint = document.querySelector('.nav-hint-bar');
-      if (navHint) navHint.innerHTML = '<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · Mouse look · <span style="color:#10b981">🎧 Voice active</span>';
-    }
-  });
+  // Close chat panel on meeting enter
+  const chatPanel = document.getElementById('chat-panel');
+  if (chatPanel) chatPanel.classList.remove('open');
+  chatPanelOpen = false;
+  document.getElementById('chat-messages').innerHTML = '<div class="chat-welcome">Messages are visible to everyone in this meeting.</div>';
+  subscribeToChat(renderChatMessage);
 
   initThreeJS();
 }
@@ -776,17 +470,44 @@ function initControls() {
       muteBtn.textContent = '🎤 Mute';
       muteBtn.classList.remove('muted');
     }
-    // Actually mute Agora audio
-    if (agoraClient) agoraClient.setMute(muted);
+  });
+
+  // Chat toggle
+  const chatBtn = document.getElementById('btn-chat');
+  const chatPanel = document.getElementById('chat-panel');
+  chatBtn?.addEventListener('click', () => {
+    chatPanelOpen = !chatPanelOpen;
+    if (chatPanel) {
+      if (chatPanelOpen) chatPanel.classList.add('open');
+      else chatPanel.classList.remove('open');
+    }
+  });
+
+  document.getElementById('btn-chat-close')?.addEventListener('click', () => {
+    chatPanelOpen = false;
+    if (chatPanel) chatPanel.classList.remove('open');
+  });
+
+  // Chat send
+  function handleChatSend() {
+    const input = document.getElementById('chat-input');
+    const text = input?.value.trim();
+    if (!text) return;
+    sendChatMessage(text);
+    input.value = '';
+  }
+
+  document.getElementById('btn-chat-send')?.addEventListener('click', handleChatSend);
+  document.getElementById('chat-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') handleChatSend();
   });
 
   document.getElementById('btn-leave')?.addEventListener('click', async () => {
     clearInterval(timerInterval);
-    if (agoraClient) await agoraClient.leaveChannel();
     if (renderer) { renderer.dispose(); renderer = null; }
+    if (chatUnsubscribe) { chatUnsubscribe(); chatUnsubscribe = null; }
     try {
-      await apiLeaveMeeting(meetingCode, currentUser?.uid);
-      await leaveMeeting(meetingCode, currentUser?.uid);
+      await apiLeaveMeeting(meetingCode, currentUser?.uid || 'guest');
     } catch (err) { /* ignore */ }
     showSummary();
   });
@@ -980,40 +701,19 @@ function initThreeJS() {
   const builders = { boardroom: buildBoardroom, studio: buildCreativeStudio, lounge: buildLounge, classroom: buildClassroom };
   (builders[roomType] || buildBoardroom)(scene);
 
-  // Mock remote participants (in production, these come from Agora data channel)
-  const mockOthers = [
-    { uid: 1001, name: 'Alex', x: -2, z: 1.5, color: 0xe74c3c },
-    { uid: 1002, name: 'Sarah', x: 2, z: 1.5, color: 0x2ecc71 },
-    { uid: 1003, name: 'James', x: -2, z: -1.5, color: 0xf39c12 },
-  ];
-
-  otherAvatars = mockOthers.map(u => {
-    const body = addMesh(scene, new THREE.CapsuleGeometry(.25,.8,4,8), { color: u.color }, [u.x,1,u.z]);
-    const head = addMesh(scene, new THREE.SphereGeometry(.2,16,16), { color: 0xe8b89a }, [u.x,1.9,u.z]);
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(.32,.38,32),
-      new THREE.MeshBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0, side: THREE.DoubleSide })
-    );
-    ring.position.set(u.x,1,u.z); ring.rotation.x = -Math.PI/2; scene.add(ring);
-    const tag = addMesh(scene, new THREE.PlaneGeometry(.9,.22), { map: makeNameTag(u.name), transparent: true }, [u.x,2.4,u.z],[0,0,0],true);
-    const remoteUser = { ...u, body, head, ring, tag, targetX: u.x, targetY: 1, targetZ: u.z };
-    // Initialize in remote users map
-    remoteUsers.set(u.uid, { position: { x: u.x, y: 1, z: u.z }, name: u.name });
-    return remoteUser;
-  });
-
-  // User avatar
-  const userColor = 0x6366f1;
+  const userColor = isGuest ? 0x10b981 : 0x6366f1;
   const userBody = addMesh(scene, new THREE.CapsuleGeometry(.25,.8,4,8), { color: userColor }, [0,1,4]);
   const userHead = addMesh(scene, new THREE.SphereGeometry(.2,16,16), { color: 0xe8b89a }, [0,1.9,4]);
-  const userTag = addMesh(scene, new THREE.PlaneGeometry(.9,.22), { map: makeNameTag(currentUserProfile?.displayName || 'You', '#6366f1'), transparent: true }, [0,2.4,4],[0,0,0],true);
+  const userTag = addMesh(scene, new THREE.PlaneGeometry(.9,.22), { map: makeNameTag(
+    isGuest ? guestDisplayName : (currentUserProfile?.displayName || 'You'),
+    isGuest ? '#10b981' : '#6366f1'
+  ), transparent: true }, [0,2.4,4],[0,0,0],true);
   const userRing = new THREE.Mesh(
     new THREE.RingGeometry(.32,.38,32),
-    new THREE.MeshBasicMaterial({ color: 0x6366f1, transparent: true, opacity: 0, side: THREE.DoubleSide })
+    new THREE.MeshBasicMaterial({ color: userColor, transparent: true, opacity: 0, side: THREE.DoubleSide })
   );
   userRing.position.set(0,1,4); userRing.rotation.x = -Math.PI/2; scene.add(userRing);
 
-  // Navigation
   const keys = {};
   const onKey = e => keys[e.key] = e.type === 'keydown';
   window.addEventListener('keydown', onKey);
@@ -1028,77 +728,22 @@ function initThreeJS() {
   });
 
   const speed = 0.06;
-  let cameraYaw = 0;
 
   function animate() {
     if (!renderer) return;
     requestAnimationFrame(animate);
     const t = Date.now() * 0.001;
 
-    // Update camera yaw for listener orientation
-    cameraYaw = -mouseX * 0.3;
+    if (keys['w']||keys['ArrowUp']) { userBody.position.z-=speed; userHead.position.z-=speed; userTag.position.z-=speed; userRing.position.z-=speed; camera.position.z-=speed; }
+    if (keys['s']||keys['ArrowDown']) { userBody.position.z+=speed; userHead.position.z+=speed; userTag.position.z+=speed; userRing.position.z+=speed; camera.position.z+=speed; }
+    if (keys['a']||keys['ArrowLeft']) { userBody.position.x-=speed; userHead.position.x-=speed; userTag.position.x-=speed; userRing.position.x-=speed; camera.position.x-=speed; }
+    if (keys['d']||keys['ArrowRight']) { userBody.position.x+=speed; userHead.position.x+=speed; userTag.position.x+=speed; userRing.position.x+=speed; camera.position.x+=speed; }
+    camera.rotation.y = -mouseX * 0.3;
 
-    let moved = false;
-    const prevX = userBody.position.x;
-    const prevZ = userBody.position.z;
-
-    if (keys['w']||keys['ArrowUp']) { userBody.position.z-=speed; userHead.position.z-=speed; userTag.position.z-=speed; userRing.position.z-=speed; camera.position.z-=speed; moved = true; }
-    if (keys['s']||keys['ArrowDown']) { userBody.position.z+=speed; userHead.position.z+=speed; userTag.position.z+=speed; userRing.position.z+=speed; camera.position.z+=speed; moved = true; }
-    if (keys['a']||keys['ArrowLeft']) { userBody.position.x-=speed; userHead.position.x-=speed; userTag.position.x-=speed; userRing.position.x-=speed; camera.position.x-=speed; moved = true; }
-    if (keys['d']||keys['ArrowRight']) { userBody.position.x+=speed; userHead.position.x+=speed; userTag.position.x+=speed; userRing.position.x+=speed; camera.position.x+=speed; moved = true; }
-
-    camera.rotation.y = cameraYaw;
-
-    // Update user position for spatial audio and Agora broadcast
-    if (moved) {
-      userPosition.x = userBody.position.x;
-      userPosition.y = 1;
-      userPosition.z = userBody.position.z;
-    }
-
-    // Update spatial audio listener position and orientation
-    if (spatialAudioManager && spatialAudioManager.initialized) {
-      spatialAudioManager.updateListenerPosition(
-        camera.position.x,
-        camera.position.y,
-        camera.position.z
-      );
-      spatialAudioManager.updateListenerOrientation(cameraYaw, 0);
-    }
-
-    // Avatar breathing animation
     userBody.position.y = 1 + Math.sin(t*1.5)*0.015;
     userHead.position.y = 1.9 + Math.sin(t*1.5)*0.015;
-
-    // Smooth interpolation for remote avatars
-    otherAvatars.forEach((u, i) => {
-      // Smooth lerp towards target position
-      if (u.targetX !== undefined) {
-        u.body.position.x += (u.targetX - u.body.position.x) * 0.1;
-        u.body.position.z += (u.targetZ - u.body.position.z) * 0.1;
-        u.head.position.x = u.body.position.x;
-        u.head.position.z = u.body.position.z;
-        u.head.position.y = 1.9 + Math.sin(t + i)*0.015;
-        u.ring.position.x = u.body.position.x;
-        u.ring.position.z = u.body.position.z;
-        u.tag.position.x = u.body.position.x;
-        u.tag.position.z = u.body.position.z;
-        u.body.position.y = 1 + Math.sin(t + i)*0.015;
-      } else {
-        u.body.position.y = 1 + Math.sin(t + i)*0.015;
-        u.head.position.y = 1.9 + Math.sin(t + i)*0.015;
-      }
-
-      // Speaking indicator (random for mock participants)
-      const speaking = Math.sin(t * (1.2 + i * 0.4) + i * 2) > 0.6;
-      u.ring.material.opacity = speaking ? 0.6 + Math.sin(t*8)*0.3 : 0;
-    });
-
-    // User speaking ring
     userRing.material.opacity = (!muted && Math.sin(t * 2.1) > 0.5) ? 0.5 + Math.sin(t*10)*0.3 : 0;
-
-    // Name tags always face camera
-    [...otherAvatars.map(u=>u.tag), userTag].forEach(tag => tag.lookAt(camera.position));
+    userTag.lookAt(camera.position);
 
     renderer.render(scene, camera);
   }
@@ -1114,7 +759,7 @@ async function showSummary() {
   const metaEl = document.getElementById('summary-meta');
   if (metaEl) metaEl.innerHTML = `<strong>${meetingName}</strong> · ${getRoomLabel(roomType)} · Duration: <strong>${mins}m ${secs}s</strong> · <strong>4 participants</strong>`;
   const participants = [
-    { name: currentUserProfile?.displayName || currentUser?.email || 'You', color: '#6366f1' },
+    { name: isGuest ? guestDisplayName : (currentUserProfile?.displayName || currentUser?.email || 'You'), color: isGuest ? '#10b981' : '#6366f1' },
     { name: 'Alex', color: '#f87171' },
     { name: 'Sarah', color: '#34d399' },
     { name: 'James', color: '#fbbf24' },
@@ -1128,7 +773,7 @@ async function showSummary() {
   if (decisionsEl) decisionsEl.innerHTML = '<div class="summary-item"><div class="summary-item-icon">📋</div><span>Processing...</span></div>';
   if (actionsEl) actionsEl.innerHTML = '<div class="summary-item"><div class="summary-item-icon">📝</div><span>Preparing action items...</span></div>';
   try {
-    const fallbackTranscript = `The team gathered to discuss the project roadmap. Sarah presented the new design system and proposed timeline adjustments. Alex highlighted the API integration blockers. The group debated feature priorities and reached consensus on the core user journey. James offered to coordinate with the testing team for the next sprint.`;
+    const fallbackTranscript = `The team gathered to discuss the project roadmap. Sarah presented the new design system and proposed timeline adjustments. Alex highlighted the API integration blockers. The group debated feature priorities and reached consensus on the core user journey. James offered to coordinate with the testing team.`;
     const summary = await apiSummarise(fallbackTranscript, meetingName, roomType, meetingTimer, participants.map(p=>p.name));
     if (topicsEl) topicsEl.innerHTML = (summary.topics || []).map(t => `<div class="summary-item"><div class="summary-item-icon">💬</div><span>${t}</span></div>`).join('');
     if (decisionsEl) decisionsEl.innerHTML = (summary.decisions || []).map(d => `<div class="summary-item"><div class="summary-item-icon">✅</div><span>${d}</span></div>`).join('');
@@ -1138,7 +783,7 @@ async function showSummary() {
     if (topicsEl) topicsEl.innerHTML = ['Project roadmap and sprint priorities','Technical blockers and resource allocation','Client presentation preparation'].map(t => `<div class="summary-item"><div class="summary-item-icon">💬</div><span>${t}</span></div>`).join('');
     if (decisionsEl) decisionsEl.innerHTML = ['Onboarding flow prioritized for next sprint','Demo scheduled for end of next week'].map(d => `<div class="summary-item"><div class="summary-item-icon">✅</div><span>${d}</span></div>`).join('');
     if (actionsEl) actionsEl.innerHTML = [
-      { owner: currentUserProfile?.displayName || 'You', task: 'Share updated roadmap document by Friday' },
+      { owner: isGuest ? guestDisplayName : 'You', task: 'Share updated roadmap document by Friday' },
       { owner: 'Alex', task: 'Resolve API integration blockers' },
       { owner: 'Sarah', task: 'Prepare demo environment and slides' },
     ].map(a => `<div class="action-item"><span class="action-owner">${a.owner}</span><span class="action-task">${a.task}</span></div>`).join('');
@@ -1149,6 +794,7 @@ async function showSummary() {
 function init() {
   document.getElementById('auth-screen').style.display = 'flex';
   document.getElementById('auth-screen').classList.add('visible');
+  initGuestModal();
   initAuth();
   initDashboard();
   initControls();
