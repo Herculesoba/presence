@@ -23,7 +23,7 @@ import {
 // ── ADMIN EMAIL CHECK ──────────────────────────────────────────
 function isAdminEmail(email) {
   const adminEmails = [
-    'herculesoba@gmail.com',  // REPLACE WITH YOUR ACTUAL EMAIL
+    'obaloluwa.akande@tech-u.edu.ng',  // ADMIN EMAIL
   ];
   return adminEmails.includes((email || '').toLowerCase());
 }
@@ -241,7 +241,20 @@ function initAuth() {
       currentUser = cred.user;
       await loadUserProfile();
     } catch (err) {
-      showError('signin-error', err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, ''));
+      const code = err.code || '';
+      let msg = err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, '');
+      if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+        msg = 'Invalid email or password';
+      } else if (code === 'auth/email-already-in-use') {
+        msg = 'Email already in use — try signing in instead';
+      } else if (code === 'auth/weak-password') {
+        msg = 'Password must be at least 6 characters';
+      } else if (code === 'auth/invalid-email') {
+        msg = 'Invalid email address';
+      } else if (code === 'auth/network-request-failed') {
+        msg = 'Network error — check your internet connection';
+      }
+      showError('signin-error', msg);
     }
     showLoading(false);
   });
@@ -261,7 +274,18 @@ function initAuth() {
       await createUserProfile(currentUser, { displayName: name });
       await loadUserProfile();
     } catch (err) {
-      showError('signup-error', err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, ''));
+      const code = err.code || '';
+      let msg = err.message.replace('Firebase: ', '').replace(/\s*\(auth\/[^\)]+\)/g, '');
+      if (code === 'auth/email-already-exists') {
+        msg = 'Email already registered — try signing in';
+      } else if (code === 'auth/invalid-email') {
+        msg = 'Invalid email address';
+      } else if (code === 'auth/weak-password') {
+        msg = 'Password must be at least 6 characters';
+      } else if (code === 'auth/network-request-failed') {
+        msg = 'Network error — check your internet connection';
+      }
+      showError('signup-error', msg);
     }
     showLoading(false);
   });
